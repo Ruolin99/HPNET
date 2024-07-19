@@ -1,11 +1,14 @@
 import pytorch_lightning as pl
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 from torch_geometric.utils import unbatch
 import math
 import pandas as pd
+
+
 
 from losses import HuberTrajLoss
 from metrics import minJointADE
@@ -16,8 +19,9 @@ from modules import MapEncoder
 from utils import generate_target
 from utils import generate_predict_mask
 from utils import compute_angles_lengths_2D
+from utils.util_stl import *
 
-#torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 
 class HPNet(pl.LightningModule):
 
@@ -91,7 +95,7 @@ class HPNet(pl.LightningModule):
                          'x6', 'y6', 'psi_rad6']
         self.test_output = dict()
 
-    def forward(self, 
+    def forward(self,
                 data: Batch):
         lane_embs = self.MapEncoder(data=data)
         pred = self.Backbone(data=data, l_embs=lane_embs)
@@ -99,19 +103,18 @@ class HPNet(pl.LightningModule):
 
     def training_step(self,data,batch_idx):
         traj_propose, traj_output = self(data)               #[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F],[(N1,...,Nb),H,K]
-        
         agent_mask = data['agent']['category'] == 1
         traj_propose = traj_propose[agent_mask]
         traj_output = traj_output[agent_mask]
 
-        target_traj, target_mask = generate_target(position=data['agent']['position'], 
+        target_traj, target_mask = generate_target(position=data['agent']['position'],
                                                    mask=data['agent']['visible_mask'],
                                                    num_historical_steps=self.num_historical_steps,
                                                    num_future_steps=self.num_future_steps)  #[(N1,...Nb),H,F,2],[(N1,...Nb),H,F]
-
+        raw = target_traj
         target_traj = target_traj[agent_mask]
         target_mask = target_mask[agent_mask]
-        
+
         agent_batch = data['agent']['batch'][agent_mask]
         batch_size = len(data['case_id'])
         errors = (torch.norm(traj_propose - target_traj.unsqueeze(2), p=2, dim=-1) * target_mask.unsqueeze(2)).sum(dim=-1)  #[(n1,...nb),H,K]
@@ -123,36 +126,52 @@ class HPNet(pl.LightningModule):
         best_mode_index = best_mode_index.repeat_interleave(num_agent_pre_batch, 0)     #[(N1,...Nb),H]
         traj_best_propose = traj_propose[torch.arange(traj_propose.size(0))[:, None], torch.arange(traj_propose.size(1))[None, :], best_mode_index]   #[(n1,...nb),H,F,2]
         traj_best_output = traj_output[torch.arange(traj_output.size(0))[:, None], torch.arange(traj_output.size(1))[None, :], best_mode_index]   #[(n1,...nb),H,F,2]
-        
+        #鲁棒性计算
+
+        results = robustness(data, raw, traj_best_output)
+        results_tensor = results.clone().detach().to(dtype=torch.float32).requires_grad_(True)
+        results_tensor.min().backward()
+
+        # 计算ADE获取梯度
+        gradient = results_tensor.grad
+        gradient_expanded = gradient[:, :, np.newaxis, np.newaxis]  # 扩展为 (12, 10, 1, 1)
+        # 调整轨迹
+        traj_best_output = traj_best_output + gradient_expanded * 0.001
+
         predict_mask = generate_predict_mask(data['agent']['visible_mask'][agent_mask,:self.num_historical_steps], self.num_visible_steps)   #[(n1,...nb),H]
         targ_mask = target_mask[predict_mask]                               #[Na,F]
         traj_pro = traj_best_propose[predict_mask]                          #[Na,F,2]
-        traj_ref = traj_best_output[predict_mask]                           #[Na,F,2]
-        targ_traj = target_traj[predict_mask]                               #[Na,F,2]
+        traj_ref = traj_best_output[predict_mask]
 
-        reg_loss_traj_propose = self.reg_loss_traj(traj_pro[targ_mask], targ_traj[targ_mask]) 
-        reg_loss_traj_refine = self.reg_loss_traj(traj_ref[targ_mask], targ_traj[targ_mask])  
-        loss = reg_loss_traj_propose + reg_loss_traj_refine
+        targ_traj = target_traj[predict_mask]
+
+        r_min = torch.min(results_tensor)
+        reg_loss_traj_propose = self.reg_loss_traj(traj_pro[targ_mask], targ_traj[targ_mask])
+        reg_loss_traj_refine = self.reg_loss_traj(traj_ref[targ_mask], targ_traj[targ_mask])
+
+        loss = reg_loss_traj_propose + reg_loss_traj_refine - r_min
+
         self.log('train_reg_loss_traj_propose', reg_loss_traj_propose, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
         self.log('train_reg_loss_traj_refine', reg_loss_traj_refine, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('r_min', r_min, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
 
         return loss
 
     def validation_step(self,data,batch_idx):
         traj_propose, traj_output = self(data)               #[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2]
-        
+
         agent_mask = data['agent']['category'] == 1
         traj_propose = traj_propose[agent_mask]
         traj_output = traj_output[agent_mask]
 
-        target_traj, target_mask = generate_target(position=data['agent']['position'], 
+        target_traj, target_mask = generate_target(position=data['agent']['position'],
                                                    mask=data['agent']['visible_mask'],
                                                    num_historical_steps=self.num_historical_steps,
                                                    num_future_steps=self.num_future_steps)  #[(N1,...Nb),H,F,2],[(N1,...Nb),H,F]
         target_traj = target_traj[agent_mask]
         target_mask = target_mask[agent_mask]
-        
+
         agent_batch = data['agent']['batch'][agent_mask]
         batch_size = len(data['case_id'])
         errors = (torch.norm(traj_propose - target_traj.unsqueeze(2), p=2, dim=-1) * target_mask.unsqueeze(2)).sum(dim=-1)  #[(n1,...nb),H,K]
@@ -164,15 +183,15 @@ class HPNet(pl.LightningModule):
         best_mode_index = best_mode_index.repeat_interleave(num_agent_pre_batch, 0)     #[(N1,...Nb),H]
         traj_best_propose = traj_propose[torch.arange(traj_propose.size(0))[:, None], torch.arange(traj_propose.size(1))[None, :], best_mode_index]   #[(n1,...nb),H,F,2]
         traj_best_output = traj_output[torch.arange(traj_output.size(0))[:, None], torch.arange(traj_output.size(1))[None, :], best_mode_index]   #[(n1,...nb),H,F,2]
-        
+
         predict_mask = generate_predict_mask(data['agent']['visible_mask'][agent_mask,:self.num_historical_steps], self.num_visible_steps)   #[(n1,...nb),H]
         targ_mask = target_mask[predict_mask]                               #[Na,F]
         traj_pro = traj_best_propose[predict_mask]                          #[Na,F,2]
         traj_ref = traj_best_output[predict_mask]                           #[Na,F,2]
         targ_traj = target_traj[predict_mask]                               #[Na,F,2]
-        
-        reg_loss_traj_propose = self.reg_loss_traj(traj_pro[targ_mask], targ_traj[targ_mask]) 
-        reg_loss_traj_refine = self.reg_loss_traj(traj_ref[targ_mask], targ_traj[targ_mask])   
+
+        reg_loss_traj_propose = self.reg_loss_traj(traj_pro[targ_mask], targ_traj[targ_mask])
+        reg_loss_traj_refine = self.reg_loss_traj(traj_ref[targ_mask], targ_traj[targ_mask])
         loss = reg_loss_traj_propose + reg_loss_traj_refine
         self.log('val_reg_loss_traj_propose', reg_loss_traj_propose, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
         self.log('val_reg_loss_traj_refine', reg_loss_traj_refine, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
@@ -211,13 +230,13 @@ class HPNet(pl.LightningModule):
         scored_agent_interset = unbatch(agent_interset, agent_batch)            #[n1,...nb]
         scored_predict_traj = unbatch(traj_output, agent_batch)           #[(n1,K,F,2),...,(nb,K,F,2)]
         scored_predict_yaw = unbatch(yaw_output, agent_batch)             #[(n1,K,F),...,(nb,K,F)]
-        
+
         case_id = case_id.cpu().numpy()
         scored_agent_id = [agent_id.cpu().numpy() for agent_id in scored_agent_id]
         scored_agent_interset = [agent_interset.cpu().numpy() for agent_interset in scored_agent_interset]
         scored_predict_traj = [predict_traj.cpu().numpy() for predict_traj in scored_predict_traj]
         scored_predict_yaw = [predict_yaw.cpu().numpy() for predict_yaw in scored_predict_yaw]
-        
+
         scored_frame_id = list(range(30))
         scored_frame_id = [id + 11 for id in scored_frame_id]
         scored_timestamp_ms = [frame_id * 100 for frame_id in scored_frame_id]
@@ -227,12 +246,12 @@ class HPNet(pl.LightningModule):
             for j in range(num_agent_pre_batch[i]):
                 for k in range(self.num_future_steps):
                     row = [case_id[i], scored_agent_id[i][j], scored_frame_id[k], scored_timestamp_ms[k], scored_agent_interset[i][j],
-                        scored_predict_traj[i][j,0,k,0], scored_predict_traj[i][j,0,k,1], scored_predict_yaw[i][j,0,k],
-                        scored_predict_traj[i][j,1,k,0], scored_predict_traj[i][j,1,k,1], scored_predict_yaw[i][j,1,k],
-                        scored_predict_traj[i][j,2,k,0], scored_predict_traj[i][j,2,k,1], scored_predict_yaw[i][j,2,k],
-                        scored_predict_traj[i][j,3,k,0], scored_predict_traj[i][j,3,k,1], scored_predict_yaw[i][j,3,k],
-                        scored_predict_traj[i][j,4,k,0], scored_predict_traj[i][j,4,k,1], scored_predict_yaw[i][j,4,k],
-                        scored_predict_traj[i][j,5,k,0], scored_predict_traj[i][j,5,k,1], scored_predict_yaw[i][j,5,k]]
+                           scored_predict_traj[i][j,0,k,0], scored_predict_traj[i][j,0,k,1], scored_predict_yaw[i][j,0,k],
+                           scored_predict_traj[i][j,1,k,0], scored_predict_traj[i][j,1,k,1], scored_predict_yaw[i][j,1,k],
+                           scored_predict_traj[i][j,2,k,0], scored_predict_traj[i][j,2,k,1], scored_predict_yaw[i][j,2,k],
+                           scored_predict_traj[i][j,3,k,0], scored_predict_traj[i][j,3,k,1], scored_predict_yaw[i][j,3,k],
+                           scored_predict_traj[i][j,4,k,0], scored_predict_traj[i][j,4,k,1], scored_predict_yaw[i][j,4,k],
+                           scored_predict_traj[i][j,5,k,0], scored_predict_traj[i][j,5,k,1], scored_predict_yaw[i][j,5,k]]
                     rows.append(row)
 
             if scenario_name[i] in self.test_output:
@@ -278,7 +297,7 @@ class HPNet(pl.LightningModule):
         ]
 
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
-        
+
         warmup_epochs = self.warmup_epochs
         T_max = self.T_max
 
@@ -301,8 +320,8 @@ class HPNet(pl.LightningModule):
         parser.add_argument('--num_historical_steps', type=int, default=10)
         parser.add_argument('--num_future_steps', type=int, default=30)
         parser.add_argument('--duration', type=int, default=10)
-        parser.add_argument('--a2a_radius', type=float, default=80)
-        parser.add_argument('--l2a_radius', type=float, default=80)
+        parser.add_argument('--a2a_radius', type=float, default=30)
+        parser.add_argument('--l2a_radius', type=float, default=30)
         parser.add_argument('--num_visible_steps', type=int, default=3)
         parser.add_argument('--num_modes', type=int, default=6)
         parser.add_argument('--num_attn_layers', type=int, default=3)

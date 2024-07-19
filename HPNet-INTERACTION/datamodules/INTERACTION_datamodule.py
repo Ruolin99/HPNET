@@ -51,7 +51,7 @@ class INTERACTIONDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.train_batch_size, shuffle=self.shuffle,
                           num_workers=self.num_workers, pin_memory=self.pin_memory,
-                          persistent_workers=self.persistent_workers)
+                          persistent_workers=self.persistent_workers, prefetch_factor=2)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.val_batch_size, shuffle=False,

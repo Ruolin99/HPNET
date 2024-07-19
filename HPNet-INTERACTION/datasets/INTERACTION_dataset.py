@@ -1,3 +1,4 @@
+
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -18,7 +19,7 @@ from utils import compute_angles_lengths_2D
 from utils import transform_point_to_local_coordinate
 from utils import get_index_of_A_in_B
 from utils import wrap_angle
-
+torch.set_float32_matmul_precision('high')
 
 class INTERACTIONDataset(Dataset):
     def __init__(self,
@@ -37,7 +38,7 @@ class INTERACTIONDataset(Dataset):
             self._directory = 'test_multi-agent'
         else:
             raise ValueError(split + ' is not valid')
-        
+
         self._raw_file_names = os.listdir(self.raw_dir)
         self._processed_file_names = []
         for raw_path in tqdm(self.raw_paths):
@@ -48,7 +49,7 @@ class INTERACTIONDataset(Dataset):
             for case_id in tqdm(df['case_id'].unique()):
                 self._processed_file_names.append(scenario_name + '_' + str(int(case_id)) + '.pt')
         self._processed_paths = [os.path.join(self.processed_dir, name) for name in self.processed_file_names]
-        
+
         self.num_historical_steps = num_historical_steps
         self.num_future_steps = num_future_steps
         self.num_steps = num_historical_steps + num_future_steps
@@ -68,7 +69,7 @@ class INTERACTIONDataset(Dataset):
     @property
     def processed_dir(self) -> str:
         return os.path.join(self.root, self._directory+'_processed')
-    
+
     @property
     def raw_file_names(self) -> Union[str, List[str], Tuple]:
         return self._raw_file_names
@@ -91,17 +92,17 @@ class INTERACTIONDataset(Dataset):
             map_path = os.path.join(base_dir,'maps',scenario_name+'.osm')
             map_api = lanelet2.io.load(map_path, self.projector)
             routing_graph = lanelet2.routing.RoutingGraph(map_api, self.traffic_rules)
-            
+
             #agent
             df = pd.read_csv(raw_path)
             for case_id, case_df in tqdm(df.groupby('case_id')):
-                data = dict()      
+                data = dict()
                 data['scenario_name'] = scenario_name
                 data['case_id'] = int(case_id)
                 data.update(self.get_features(case_df, map_api, routing_graph))
                 torch.save(data, os.path.join(self.processed_dir, scenario_name + '_' + str(int(case_id)) + '.pt'))
 
-    def get_features(self, 
+    def get_features(self,
                      df: pd.DataFrame,
                      map_api,
                      routing_graph) -> Dict:
@@ -134,7 +135,7 @@ class INTERACTIONDataset(Dataset):
         agent_type = torch.zeros(num_agents, dtype=torch.uint8)
         agent_category = torch.zeros(num_agents, dtype=torch.uint8)
         agent_interset = torch.zeros(num_agents, dtype=torch.uint8)
-        
+
         for track_id, track_df in df.groupby('track_id'):
             agent_idx = agent_ids.index(track_id)
             agent_id[agent_idx] = track_id
@@ -182,12 +183,16 @@ class INTERACTIONDataset(Dataset):
         data['agent']['type'] = agent_type
         data['agent']['category'] = agent_category
         data['agent']['interest'] = agent_interset
-        
+        data['agent']['velocity'] = agent_velocity
+
+        # 添加调试信息，确保 'agent' 键存在
+        print("Data keys in get_features:", data.keys())
+
         #MAP
         lane_ids = []
-        for lane in map_api.laneletLayer: 
+        for lane in map_api.laneletLayer:
             lane_ids.append(lane.id)
-        
+
         num_lanes = len(lane_ids)
         lane_id = torch.zeros(num_lanes, dtype=torch.float)
         lane_position = torch.zeros(num_lanes, 2, dtype=torch.float)
@@ -205,7 +210,7 @@ class INTERACTIONDataset(Dataset):
         lane_predecessor_edge_index = []
         lane_successor_edge_index = []
 
-        for lane in map_api.laneletLayer: 
+        for lane in map_api.laneletLayer:
             lane_idx = lane_ids.index(lane.id)
             lane_id[lane_idx] = lane.id
 
@@ -214,15 +219,15 @@ class INTERACTIONDataset(Dataset):
 
             center_index = int((centerline.size(0)-1)/2)
             lane_position[lane_idx] = centerline[center_index, :2]
-            lane_heading[lane_idx] = torch.atan2(centerline[center_index+1, 1] - centerline[center_index, 1], 
+            lane_heading[lane_idx] = torch.atan2(centerline[center_index+1, 1] - centerline[center_index, 1],
                                                  centerline[center_index+1, 0] - centerline[center_index, 0])
             lane_length[lane_idx] = torch.norm(centerline[1:] - centerline[:-1], p=2, dim=-1).sum()
-            
+
             points = [np.array([pt.x, pt.y]) for pt in lane.leftBound]
             left_boundary = torch.from_numpy(np.array(points)).float()
             points = [np.array([pt.x, pt.y]) for pt in lane.rightBound]
             right_boundary = torch.from_numpy(np.array(points)).float()
-            left_vector = left_boundary[1:] - left_boundary[:-1]      
+            left_vector = left_boundary[1:] - left_boundary[:-1]
             right_vector = right_boundary[1:] - right_boundary[:-1]
             centerline_vector = centerline[1:] - centerline[:-1]
             polyline_position[lane_idx] = torch.cat([(left_boundary[1:] + left_boundary[:-1])/2, (right_boundary[1:] + right_boundary[:-1])/2, (centerline[1:] + centerline[:-1])/2], dim=0)
@@ -293,7 +298,7 @@ class INTERACTIONDataset(Dataset):
             lane_successor_edge_index = torch.cat(lane_successor_edge_index, dim=1)
         else:
             lane_successor_edge_index = torch.tensor([[], []], dtype=torch.long)
-        
+
         data['lane', 'lane']['left_neighbor_edge_index'] = lane_left_neighbor_edge_index
         data['lane', 'lane']['right_neighbor_edge_index'] = lane_right_neighbor_edge_index
         data['lane', 'lane']['predecessor_edge_index'] = lane_predecessor_edge_index
@@ -304,5 +309,5 @@ class INTERACTIONDataset(Dataset):
     def len(self) -> int:
         return len(self.processed_file_names)
 
-    def get(self, idx: int) -> HeteroData:     
+    def get(self, idx: int) -> HeteroData:
         return HeteroData(torch.load(self.processed_paths[idx]))
