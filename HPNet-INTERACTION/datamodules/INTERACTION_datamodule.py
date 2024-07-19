@@ -48,6 +48,7 @@ class INTERACTIONDataModule(pl.LightningDataModule):
         self.train_dataset = INTERACTIONDataset(self.root, 'train', self.train_transform, self.num_historical_steps, self.num_future_steps)
         self.val_dataset = INTERACTIONDataset(self.root, 'val', self.val_transform, self.num_historical_steps, self.num_future_steps)
 
+
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.train_batch_size, shuffle=self.shuffle,
                           num_workers=self.num_workers, pin_memory=self.pin_memory,

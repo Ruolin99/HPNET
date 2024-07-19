@@ -16,7 +16,7 @@ from utils import transform_point_to_global_coordinate
 from utils import transform_traj_to_global_coordinate
 from utils import transform_traj_to_local_coordinate
 
-torch.set_float32_matmul_precision('high')
+
 
 
 class Backbone(nn.Module):
