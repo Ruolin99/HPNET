@@ -116,26 +116,12 @@ def compute_min_distances(car_positions, others_positions, car_lengths, car_widt
     num_others = others_positions.shape[0]
 
     # 初始化结果数组
-    min_dist_car_to_car = torch.full((num_cars, H), float('inf'), device=device)
     min_dist_car_to_others = torch.full((num_cars, H), 1000.0 if num_others == 0 else float('inf'), device=device)
-    min_dist_car_to_car_idx = torch.full((num_cars, H, 2), -1, device=device, dtype=torch.int)
     min_dist_car_to_others_idx = torch.full((num_cars, H, 2), -1, device=device, dtype=torch.int)
 
     # 计算车辆之间的最小距离
     for i in range(num_cars):
         car_i_positions = car_positions[i].unsqueeze(0).expand(num_cars, -1, -1, -1)
-
-        # 调整距离考虑车辆尺寸
-        adjusted_dist_x = torch.abs(car_i_positions[..., 0] - car_positions[..., 0]) - (car_lengths[i] / 2 + car_lengths / 2).view(-1, 1, 1)
-        adjusted_dist_y = torch.abs(car_i_positions[..., 1] - car_positions[..., 1]) - (car_widths[i] / 2 + car_widths / 2).view(-1, 1, 1)
-
-        adjusted_distances = torch.sqrt(adjusted_dist_x ** 2 + adjusted_dist_y ** 2)
-
-        for h in range(H):
-            min_dist, idx = torch.min(adjusted_distances[:, h].reshape(-1), dim=-1)
-            idx_f = idx.item() % F
-            min_dist_car_to_car[i, h] = min_dist
-            min_dist_car_to_car_idx[i, h] = torch.tensor([h, idx_f], device=device)
 
     # 计算车辆与其他交通参与者之间的最小距离
     if num_others > 0:
@@ -149,29 +135,18 @@ def compute_min_distances(car_positions, others_positions, car_lengths, car_widt
                 min_dist_car_to_others[i, h] = min_dist
                 min_dist_car_to_others_idx[i, h] = torch.tensor([h, idx_f], device=device)
 
-    return min_dist_car_to_car, min_dist_car_to_others, min_dist_car_to_car_idx, min_dist_car_to_others_idx
+    return min_dist_car_to_others, min_dist_car_to_others_idx
 
-def compute_headway_distances(car_speeds, car_lengths, min_dist_car_to_car_idx, min_dist_car_to_others_idx, time_gap):
+def compute_headway_distances(car_speeds, min_dist_car_to_others_idx, time_gap):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     car_speeds = car_speeds.to(device)
 
     num_cars, H, F, _ = car_speeds.shape
 
-    # 初始化结果数组
-    min_headway_car_to_car = torch.zeros((num_cars, H), device=device)
+
     min_headway_car_to_others = torch.zeros((num_cars, H), device=device)
 
-    # 计算车辆之间的最小车头时距距离
-    for i in range(num_cars):
-        for h in range(H):
-            if min_dist_car_to_car_idx[i, h, 0] != -1:
-                idx_h = min_dist_car_to_car_idx[i, h, 0].item()
-                idx_f = min_dist_car_to_car_idx[i, h, 1].item()
-                if idx_f < F:  # 检查索引是否在范围内
-                    speed_vector = car_speeds[i, idx_h, idx_f]
-                    speed_magnitude = torch.sqrt(torch.sum(speed_vector ** 2))
-                    min_headway_car_to_car[i, h] = speed_magnitude * time_gap-car_lengths[i]
 
     # 计算车辆与其他交通参与者之间的最小车头时距距离
     for i in range(num_cars):
@@ -184,7 +159,7 @@ def compute_headway_distances(car_speeds, car_lengths, min_dist_car_to_car_idx, 
                     speed_magnitude = torch.sqrt(torch.sum(speed_vector ** 2))
                     min_headway_car_to_others[i, h] = speed_magnitude * time_gap
 
-    return min_headway_car_to_car, min_headway_car_to_others
+    return min_headway_car_to_others
 
 
 def robustness(data, raw, trajectory_proposed):
@@ -209,14 +184,14 @@ def robustness(data, raw, trajectory_proposed):
     car_widths = data['agent']['width'][car_indices].to('cuda')
     velocities = (car_positions[:, :, 1:] - car_positions[:, :, :-1]) * 10
     # Compute collision robustness between vehicles and between vehicles and other road users
-    min_dist_car_to_car, min_dist_car_to_others, min_dist_car_to_car_idx, min_dist_car_to_others_idx = compute_min_distances(
+    min_dist_car_to_others, min_dist_car_to_others_idx = compute_min_distances(
         car_positions, others_positions, car_lengths, car_widths)
 
     # 调用计算车头时距的函数
     # Compute velocities and time headway
     velocities = (car_positions[:, :, 1:] - car_positions[:, :, :-1]) * 10
-    min_headway_car_to_car, min_headway_car_to_others = compute_headway_distances(
-        velocities, car_lengths, min_dist_car_to_car_idx, min_dist_car_to_others_idx,time_gap=2)
+    min_headway_car_to_others = compute_headway_distances(
+        velocities,  min_dist_car_to_others_idx,time_gap=2)
     # Compute ETTC
     min_other_ttc, min_vehicle_ttc = calculate_ettc(
         car_positions, car_velocities, others_positions, others_velocities
@@ -225,20 +200,17 @@ def robustness(data, raw, trajectory_proposed):
     # Calculate deltas
     delta_other_ttc = min_other_ttc - 1.6
     delta_vehicle_ttc = min_vehicle_ttc - 1.5
-    delta_min_car_car_y = min_dist_car_to_car- min_headway_car_to_car
     delta_min_car_others_y = min_dist_car_to_others - min_headway_car_to_others
 
     deltas = {
         'delta_other_ttc': delta_other_ttc,
         'delta_vehicle_ttc': delta_vehicle_ttc,
-        'delta_min_car_car_y': delta_min_car_car_y,
         'delta_min_car_others_y': delta_min_car_others_y
     }
 
     threshold_dict = {
         'delta_other_ttc': 1.6,
         'delta_vehicle_ttc': 1.5,
-        'delta_min_car_car_y': torch.mean(min_headway_car_to_car).item(),
         'delta_min_car_others_y': torch.mean(min_headway_car_to_others).item()
     }
 

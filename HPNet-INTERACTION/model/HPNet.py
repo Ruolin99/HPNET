@@ -19,7 +19,7 @@ from modules import MapEncoder
 from utils import generate_target
 from utils import generate_predict_mask
 from utils import compute_angles_lengths_2D
-from utils.util_stl import *
+from utils.util_stl_xr_vehcled import *
 
 
 
