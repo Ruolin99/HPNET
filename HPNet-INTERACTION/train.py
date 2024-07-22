@@ -17,6 +17,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_batch_size', type=int, required=True)
     parser.add_argument('--val_batch_size', type=int, required=True)
     parser.add_argument('--shuffle', type=bool, default=True)
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--num_workers', type=int, required=True)
     parser.add_argument('--pin_memory', type=bool, default=True)
     parser.add_argument('--persistent_workers', type=bool, default=True)

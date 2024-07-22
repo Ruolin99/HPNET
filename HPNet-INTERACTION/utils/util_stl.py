@@ -1,11 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jul 19 22:01:52 2024
+
+@author: Ruolin Shi
+"""
+
 import torch
 import math
 from typing import Tuple
 
-torch.set_float32_matmul_precision('high')
+#torch.set_float32_matmul_precision('high')
 
 
-def generate_target(position: torch.Tensor, mask: torch.Tensor, num_historical_steps: int, num_future_steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def generate_target(position: torch.Tensor, mask: torch.Tensor, num_historical_steps: int, num_future_steps: int) -> \
+        Tuple[torch.Tensor, torch.Tensor]:
     target_traj = [position[:, i + 1:i + 1 + num_future_steps] for i in range(num_historical_steps)]
     target_traj = torch.stack(target_traj, dim=1)
     target_mask = [mask[:, i + 1:i + 1 + num_future_steps] for i in range(num_historical_steps)]
@@ -24,12 +32,13 @@ def calculate_vehicle_ttc(car_positions, car_velocities):
     relative_speed_sq = torch.sum(delta_vel ** 2, dim=-1)
     valid_mask = relative_speed_sq != 0
     ttc = -torch.sum(delta_pos * delta_vel, dim=-1) / relative_speed_sq
-    ttc[~valid_mask] = float('inf')
-    ttc[ttc <= 0] = float('inf')
+    ttc[~valid_mask] = float('1000')
+    ttc[ttc <= 0] = float('1000')
 
     vehicle_ttc = torch.min(vehicle_ttc, ttc)
 
     return vehicle_ttc
+
 
 def process_ettc_ttcx_ttcy_ttcyy(ettc, ttcx, ttcy, ttcyy):
     min_ettc, _ = torch.min(ettc, dim=1)
@@ -46,6 +55,7 @@ def process_ettc_ttcx_ttcy_ttcyy(ettc, ttcx, ttcy, ttcyy):
     sum_min, _ = torch.min(min_ttc, dim=-1)
 
     return sum_min
+
 
 def calculate_ettc(car_positions, car_velocities, others_positions, others_velocities):
     num_cars, H, F, _ = car_positions.shape
@@ -86,105 +96,95 @@ def calculate_ettc(car_positions, car_velocities, others_positions, others_veloc
         ttcx = torch.full((num_cars, H, F), 1000.0, device=car_positions.device)
         ttcy = torch.full((num_cars, H, F), 1000.0, device=car_positions.device)
         ttcyy = torch.full((num_cars, H, F), 1000.0, device=car_positions.device)
-        sum_min = process_ettc_ttcx_ttcy_ttcyy(ettc.unsqueeze(1), ttcx.unsqueeze(1), ttcy.unsqueeze(1), ttcyy.unsqueeze(1))
+        sum_min = process_ettc_ttcx_ttcy_ttcyy(ettc.unsqueeze(1), ttcx.unsqueeze(1), ttcy.unsqueeze(1),
+                                               ttcyy.unsqueeze(1))
 
     vehicle_ttc = calculate_vehicle_ttc(car_positions, car_velocities)
     min_vehicle_ttc = torch.min(vehicle_ttc, dim=1)[0].min(dim=-1)[0]
 
     return sum_min, min_vehicle_ttc
 
-
-
-def calculate_robustness_d(traj_in, traj_oc_in):
-    r_ox = torch.abs(traj_in[:, 0] - traj_oc_in[:, 0])
-    r_oy = torch.abs(traj_in[:, 1] - traj_oc_in[:, 1])
-    return torch.min(r_ox), torch.min(r_oy)
-
-def calculate_robustness_car(traj_in, size_in, traj_oc_in, size_oc_in):
-    r_ox = torch.abs(traj_in[:, 0] - traj_oc_in[:, 0]) - size_in[0] / 2 - size_oc_in[0] / 2
-    r_oy = torch.abs(traj_in[:, 1] - traj_oc_in[:, 1]) - size_in[1] / 2 - size_oc_in[1] / 2
-    return torch.min(r_ox), torch.min(r_oy)
-
-def compute_robustness_collision(raw, trajectory_proposed, data):
+def compute_min_distances(car_positions, others_positions, car_lengths, car_widths):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    car_indices = torch.where(data['agent']['category'] == 1)[0]
-    others_indices = torch.where(data['agent']['category'] != 1)[0]
+    car_positions = car_positions.to(device)
+    others_positions = others_positions.to(device)
+    car_lengths = car_lengths.to(device)
+    car_widths = car_widths.to(device)
 
-    car_positions = trajectory_proposed.to(device)
-    others_positions = raw[others_indices].to(device)
-    car_lengths = data['agent']['length'][car_indices].to(device)
-    car_widths = data['agent']['width'][car_indices].to(device)
+    num_cars, H, F, _ = car_positions.shape
+    num_others = others_positions.shape[0]
 
-    num_cars = len(car_indices)
-    num_others = len(others_indices)
-    H = car_positions.shape[1]
+    # 初始化结果数组
+    min_dist_car_to_car = torch.full((num_cars, H), float('inf'), device=device)
+    min_dist_car_to_others = torch.full((num_cars, H), 1000.0 if num_others == 0 else float('inf'), device=device)
+    min_dist_car_to_car_idx = torch.full((num_cars, H, 2), -1, device=device, dtype=torch.int)
+    min_dist_car_to_others_idx = torch.full((num_cars, H, 2), -1, device=device, dtype=torch.int)
 
-    sizes_in = torch.stack([car_lengths, car_widths], dim=1).to(device)
+    # 计算车辆之间的最小距离
+    for i in range(num_cars):
+        car_i_positions = car_positions[i].unsqueeze(0).expand(num_cars, -1, -1, -1)
 
-    # Initialize robustness tensors
-    min_robustness_car_car_x = torch.full((num_cars, H), 1000.0, device=device)
-    min_robustness_car_car_y = torch.full((num_cars, H), 1000.0, device=device)
-    min_robustness_car_others_x = torch.full((num_cars, H), 1000.0, device=device)
-    min_robustness_car_others_y = torch.full((num_cars, H), 1000.0, device=device)
+        # 调整距离考虑车辆尺寸
+        adjusted_dist_x = torch.abs(car_i_positions[..., 0] - car_positions[..., 0]) - (car_lengths[i] / 2 + car_lengths / 2).view(-1, 1, 1)
+        adjusted_dist_y = torch.abs(car_i_positions[..., 1] - car_positions[..., 1]) - (car_widths[i] / 2 + car_widths / 2).view(-1, 1, 1)
 
-    for t in range(H):
-        traj_in_t = car_positions[:, t, :, :]
+        adjusted_distances = torch.sqrt(adjusted_dist_x ** 2 + adjusted_dist_y ** 2)
 
-        # Calculate car-car robustness
+        for h in range(H):
+            min_dist, idx = torch.min(adjusted_distances[:, h].reshape(-1), dim=-1)
+            idx_f = idx.item() % F
+            min_dist_car_to_car[i, h] = min_dist
+            min_dist_car_to_car_idx[i, h] = torch.tensor([h, idx_f], device=device)
+
+    # 计算车辆与其他交通参与者之间的最小距离
+    if num_others > 0:
         for i in range(num_cars):
-            traj_i_t = traj_in_t[i]
-            size_in = sizes_in[i]
+            car_i_positions = car_positions[i].unsqueeze(0).expand(num_others, -1, -1, -1)
+            others_distances = torch.sqrt(torch.sum((car_i_positions - others_positions) ** 2, dim=-1))
 
-            r_ox_cars, r_oy_cars = [], []
-            for j in range(num_cars):
-                if i != j:
-                    traj_j_t = traj_in_t[j]
-                    size_oc_in = sizes_in[j]
+            for h in range(H):
+                min_dist, idx = torch.min(others_distances[:, h].reshape(-1), dim=-1)
+                idx_f = idx.item() % F
+                min_dist_car_to_others[i, h] = min_dist
+                min_dist_car_to_others_idx[i, h] = torch.tensor([h, idx_f], device=device)
 
-                    r_ox, r_oy = calculate_robustness_car(traj_i_t, size_in, traj_j_t, size_oc_in)
-                    r_ox_cars.append(r_ox)
-                    r_oy_cars.append(r_oy)
+    return min_dist_car_to_car, min_dist_car_to_others, min_dist_car_to_car_idx, min_dist_car_to_others_idx
 
-            if r_ox_cars:
-                min_robustness_car_car_x[i, t] = torch.min(torch.stack(r_ox_cars))
-            if r_oy_cars:
-                min_robustness_car_car_y[i, t] = torch.min(torch.stack(r_oy_cars))
+def compute_headway_distances(car_speeds, car_lengths, min_dist_car_to_car_idx, min_dist_car_to_others_idx, time_gap):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Calculate car-others robustness
-        for car_idx in range(num_cars):
-            traj_in_t = car_positions[car_idx, t, :, :]
+    car_speeds = car_speeds.to(device)
 
-            r_ox_others, r_oy_others = [], []
-            for other_idx in range(num_others):
-                traj_oc_in = others_positions[other_idx]
-                traj_oc_in_t = traj_oc_in[t, :, :]
+    num_cars, H, F, _ = car_speeds.shape
 
-                r_ox, r_oy = calculate_robustness_d(traj_in_t, traj_oc_in_t)
-                r_ox_others.append(r_ox)
-                r_oy_others.append(r_oy)
+    # 初始化结果数组
+    min_headway_car_to_car = torch.zeros((num_cars, H), device=device)
+    min_headway_car_to_others = torch.zeros((num_cars, H), device=device)
 
-            if r_ox_others:
-                min_robustness_car_others_x[car_idx, t] = torch.min(torch.stack(r_ox_others))
-            if r_oy_others:
-                min_robustness_car_others_y[car_idx, t] = torch.min(torch.stack(r_oy_others))
+    # 计算车辆之间的最小车头时距距离
+    for i in range(num_cars):
+        for h in range(H):
+            if min_dist_car_to_car_idx[i, h, 0] != -1:
+                idx_h = min_dist_car_to_car_idx[i, h, 0].item()
+                idx_f = min_dist_car_to_car_idx[i, h, 1].item()
+                if idx_f < F:  # 检查索引是否在范围内
+                    speed_vector = car_speeds[i, idx_h, idx_f]
+                    speed_magnitude = torch.sqrt(torch.sum(speed_vector ** 2))
+                    min_headway_car_to_car[i, h] = speed_magnitude * time_gap-car_lengths[i]
 
-    return min_robustness_car_car_x, min_robustness_car_car_y, min_robustness_car_others_x, min_robustness_car_others_y
+    # 计算车辆与其他交通参与者之间的最小车头时距距离
+    for i in range(num_cars):
+        for h in range(H):
+            if min_dist_car_to_others_idx[i, h, 0] != -1:
+                idx_h = min_dist_car_to_others_idx[i, h, 0].item()
+                idx_f = min_dist_car_to_others_idx[i, h, 1].item()
+                if idx_f < F:  # 检查索引是否在范围内
+                    speed_vector = car_speeds[i, idx_h, idx_f]
+                    speed_magnitude = torch.sqrt(torch.sum(speed_vector ** 2))
+                    min_headway_car_to_others[i, h] = speed_magnitude * time_gap
 
-
-
-def compute_time_headway(velocities, time_gap=2):
-    velocities[torch.abs(velocities) > 1000] = 0
-
-    speed_magnitudes = torch.norm(velocities, dim=3)
-    time_headway = torch.zeros((velocities.shape[0], velocities.shape[1]), dtype=torch.float32, device='cuda')
-
-    mean_time_headway = torch.mean(speed_magnitudes, dim=-1) * time_gap
-    time_headway[:, :] = mean_time_headway
-
-    return time_headway
-
-
+    return min_headway_car_to_car, min_headway_car_to_others
 
 
 def robustness(data, raw, trajectory_proposed):
@@ -205,15 +205,18 @@ def robustness(data, raw, trajectory_proposed):
     car_velocities = car_velocities_sum[car_indices]
     others_velocities = car_velocities_sum[others_indices]
 
+    car_lengths = data['agent']['length'][car_indices].to('cuda')
+    car_widths = data['agent']['width'][car_indices].to('cuda')
+    velocities = (car_positions[:, :, 1:] - car_positions[:, :, :-1]) * 10
     # Compute collision robustness between vehicles and between vehicles and other road users
-    min_robustness_car_car_x, min_robustness_car_car_y, min_robustness_car_others_x, min_robustness_car_others_y = compute_robustness_collision(
-        raw, trajectory_proposed, data
-    )
+    min_dist_car_to_car, min_dist_car_to_others, min_dist_car_to_car_idx, min_dist_car_to_others_idx = compute_min_distances(
+        car_positions, others_positions, car_lengths, car_widths)
 
+    # 调用计算车头时距的函数
     # Compute velocities and time headway
     velocities = (car_positions[:, :, 1:] - car_positions[:, :, :-1]) * 10
-    time_headway = compute_time_headway(velocities, time_gap=2)
-
+    min_headway_car_to_car, min_headway_car_to_others = compute_headway_distances(
+        velocities, car_lengths, min_dist_car_to_car_idx, min_dist_car_to_others_idx,time_gap=2)
     # Compute ETTC
     min_other_ttc, min_vehicle_ttc = calculate_ettc(
         car_positions, car_velocities, others_positions, others_velocities
@@ -222,27 +225,22 @@ def robustness(data, raw, trajectory_proposed):
     # Calculate deltas
     delta_other_ttc = min_other_ttc - 1.6
     delta_vehicle_ttc = min_vehicle_ttc - 1.5
-    delta_min_car_car_x = torch.min(min_robustness_car_car_x, min_robustness_car_car_y) - 2
-    delta_max_car_car_y = torch.max(min_robustness_car_car_x, min_robustness_car_car_y) - time_headway
-    delta_min_car_others_x = torch.min(min_robustness_car_others_x, min_robustness_car_others_y) - 1.5
-    delta_max_car_others_x = torch.max(min_robustness_car_others_x, min_robustness_car_others_y) - time_headway
+    delta_max_car_car_y = min_dist_car_to_car- min_headway_car_to_car
+    delta_max_car_others_y = min_dist_car_to_others - min_headway_car_to_others
 
     deltas = {
         'delta_other_ttc': delta_other_ttc,
         'delta_vehicle_ttc': delta_vehicle_ttc,
-        'delta_min_car_car_x': delta_min_car_car_x,
         'delta_max_car_car_y': delta_max_car_car_y,
-        'delta_min_car_others_x': delta_min_car_others_x,
-        'delta_max_car_others_x': delta_max_car_others_x
+        'delta_min_car_others_x': delta_max_car_others_y
     }
 
     threshold_dict = {
         'delta_other_ttc': 1.6,
         'delta_vehicle_ttc': 1.5,
-        'delta_min_car_car_x': 2,
-        'delta_max_car_car_y': torch.mean(time_headway).item(),
+        'delta_max_car_car_y': torch.mean(min_headway_car_to_car).item(),
         'delta_min_car_others_x': 1.5,
-        'delta_max_car_others_x': torch.mean(time_headway).item()
+        'delta_max_car_others_x': torch.mean(min_headway_car_to_others).item()
     }
 
     results = torch.zeros_like(delta_other_ttc, device='cuda')
@@ -253,7 +251,8 @@ def robustness(data, raw, trajectory_proposed):
             negative_values = {key: value for key, value in car_deltas.items() if (value < 0).any()}
 
             if negative_values:
-                percentage_above_thresholds = {key: (torch.abs(value) / threshold_dict[key]) * 100 for key, value in negative_values.items()}
+                percentage_above_thresholds = {key: (torch.abs(value) / threshold_dict[key]) * 100 for key, value in
+                                               negative_values.items()}
                 max_percentage_key = max(percentage_above_thresholds, key=percentage_above_thresholds.get)
                 results[i, j] = negative_values[max_percentage_key].min()
             else:
