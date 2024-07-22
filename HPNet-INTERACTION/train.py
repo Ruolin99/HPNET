@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--agent_occlusion_ratio', type=float, default=0.0)
     parser.add_argument('--lane_occlusion_ratio', type=float, default=0.2)
     parser.add_argument('--devices', type=int, required=True)
-    parser.add_argument('--max_epochs', type=int, default=64)
+    parser.add_argument('--max_epochs', type=int, default=30)
     HPNet.add_model_specific_args(parser)
     args = parser.parse_args()
 
