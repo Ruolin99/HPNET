@@ -40,5 +40,5 @@ if __name__ == '__main__':
         max_epochs=args.max_epochs,
     )
     trainer.fit(model, datamodule)
-    save_path = '/home/shra/workspace/HPNet/HPNet-INTERACTION/'  # 你可以根据需要修改路径和文件名
+    save_path = './'  # 你可以根据需要修改路径和文件名/home/shra/workspace/HPNet/HPNet-INTERACTION
     torch.save(model.state_dict(), save_path)
