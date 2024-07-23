@@ -225,21 +225,22 @@ def robustness(data, raw, trajectory_proposed):
     # Calculate deltas
     delta_other_ttc = min_other_ttc - 1.6
     delta_vehicle_ttc = min_vehicle_ttc - 1.5
-    delta_min_car_car_y = min_dist_car_to_car- min_headway_car_to_car
-    delta_min_car_others_y = min_dist_car_to_others - min_headway_car_to_others
+    delta_max_car_car_y = min_dist_car_to_car- min_headway_car_to_car
+    delta_max_car_others_y = min_dist_car_to_others - min_headway_car_to_others
 
     deltas = {
         'delta_other_ttc': delta_other_ttc,
         'delta_vehicle_ttc': delta_vehicle_ttc,
-        'delta_min_car_car_y': delta_min_car_car_y,
-        'delta_min_car_others_y': delta_min_car_others_y
+        'delta_max_car_car_y': delta_max_car_car_y,
+        'delta_min_car_others_x': delta_max_car_others_y
     }
 
     threshold_dict = {
         'delta_other_ttc': 1.6,
         'delta_vehicle_ttc': 1.5,
-        'delta_min_car_car_y': torch.mean(min_headway_car_to_car).item(),
-        'delta_min_car_others_y': torch.mean(min_headway_car_to_others).item()
+        'delta_max_car_car_y': torch.mean(min_headway_car_to_car).item(),
+        'delta_min_car_others_x': 1.5,
+        'delta_max_car_others_x': torch.mean(min_headway_car_to_others).item()
     }
 
     results = torch.zeros_like(delta_other_ttc, device='cuda')
